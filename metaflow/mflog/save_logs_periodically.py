@@ -2,7 +2,7 @@ import os
 import sys
 import time
 import subprocess
-from threading import Thread
+from threading import Event, Thread
 
 from metaflow.sidecar import MessageTypes
 from metaflow.util import to_unicode
@@ -29,9 +29,33 @@ class SaveLogsPeriodicallySidecar(object):
         self._enable_tracing = options.get("enable_tracing", False)
         if not isinstance(self._enable_tracing, bool):
             raise TypeError("enable_tracing must be a boolean")
+
+        self._debug_hooks = self._load_debug_hooks()
+        if self._debug_hooks is not None:
+            self._fault_mode = self._debug_hooks._fault_mode()
+            self._fault_triggered = Event()
+
         self._thread = Thread(target=self._update_loop)
         self.is_alive = True
         self._thread.start()
+
+        if self._debug_hooks is not None and self._fault_mode:
+            self._fault_thread = Thread(
+                target=self._inject_fault,
+                name="log-publisher-fault-injection",
+                daemon=True,
+            )
+            self._fault_thread.start()
+
+    def _load_debug_hooks(self):
+        if not self._enable_tracing:
+            return None
+        try:
+            from metaflow_extensions.nflx.plugins import log_upload_tracing
+
+            return log_upload_tracing
+        except ImportError:
+            return None
 
     def process_message(self, msg):
         if msg.msg_type == MessageTypes.SHUTDOWN:
@@ -55,7 +79,36 @@ class SaveLogsPeriodicallySidecar(object):
         _write_save_logs_output("stderr", stderr)
         return process.returncode
 
+    def _inject_fault(self):
+        hooks = self._debug_hooks
+        time.sleep(
+            hooks._float_env(hooks.FAULT_DELAY_ENV_VAR, hooks.FAULT_DELAY_SECONDS)
+        )
+        hooks._write_fault_marker(self._fault_mode)
+        hooks._trace("fault_injection_triggered", fault_mode=self._fault_mode)
+        self._fault_triggered.set()
+        if self._fault_mode == hooks.FAULT_PROCESS_EXIT:
+            os._exit(hooks.FAULT_EXIT_CODE)
+        if self._fault_mode == hooks.FAULT_THREAD_FAILURE:
+            self.is_alive = False
+
+    def _upload_logs(self):
+        hooks = getattr(self, "_debug_hooks", None)
+        if hooks is not None and self._fault_triggered.is_set():
+            if self._fault_mode == hooks.FAULT_UPLOAD_HANG:
+                time.sleep(
+                    hooks._float_env(
+                        hooks.FAULT_HANG_ENV_VAR, hooks.FAULT_HANG_SECONDS
+                    )
+                )
+                return None
+            if self._fault_mode == hooks.FAULT_UPLOAD_FAILURE:
+                return hooks.FAULT_EXIT_CODE
+        return self._call_save_logs()
+
     def _update_loop(self):
+        debug_hooks = getattr(self, "_debug_hooks", None)
+
         def _file_size(path):
             if os.path.exists(path):
                 return os.path.getsize(path)
@@ -82,7 +135,14 @@ class SaveLogsPeriodicallySidecar(object):
                             % (path, previous, current, current - previous, elapsed),
                         )
                 try:
-                    self._call_save_logs()
+                    self._upload_logs()
                 except:
                     pass
             time.sleep(update_delay(time.time() - start_time))
+
+        if (
+            debug_hooks is not None
+            and self._fault_mode == debug_hooks.FAULT_THREAD_FAILURE
+            and self._fault_triggered.is_set()
+        ):
+            raise RuntimeError("Injected log publisher thread failure")

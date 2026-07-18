@@ -1,5 +1,6 @@
 import json
 import subprocess
+from threading import Event
 from types import SimpleNamespace
 
 import pytest
@@ -122,6 +123,54 @@ def test_worker_without_options_uses_legacy_constructor():
 def test_log_publisher_rejects_invalid_options(options):
     with pytest.raises((TypeError, ValueError)):
         SaveLogsPeriodicallySidecar(options=options)
+
+
+def test_debug_fault_exits_publisher_process(mocker):
+    hooks = SimpleNamespace(
+        FAULT_DELAY_ENV_VAR="METAFLOW_DEBUG_LOG_UPLOAD_FAULT_DELAY_SECONDS",
+        FAULT_DELAY_SECONDS=8,
+        FAULT_PROCESS_EXIT="publisher_process_exit",
+        FAULT_THREAD_FAILURE="publisher_thread_failure",
+        FAULT_EXIT_CODE=70,
+        _float_env=mocker.Mock(return_value=0),
+        _write_fault_marker=mocker.Mock(),
+        _trace=mocker.Mock(),
+    )
+    publisher = SaveLogsPeriodicallySidecar.__new__(SaveLogsPeriodicallySidecar)
+    publisher._debug_hooks = hooks
+    publisher._fault_mode = hooks.FAULT_PROCESS_EXIT
+    publisher._fault_triggered = Event()
+    publisher.is_alive = True
+    mocker.patch("metaflow.mflog.save_logs_periodically.time.sleep")
+    exit_process = mocker.patch("metaflow.mflog.save_logs_periodically.os._exit")
+
+    publisher._inject_fault()
+
+    hooks._write_fault_marker.assert_called_once_with(hooks.FAULT_PROCESS_EXIT)
+    hooks._trace.assert_called_once_with(
+        "fault_injection_triggered", fault_mode=hooks.FAULT_PROCESS_EXIT
+    )
+    assert publisher._fault_triggered.is_set()
+    exit_process.assert_called_once_with(70)
+
+
+def test_debug_upload_failure_skips_uploader(mocker):
+    hooks = SimpleNamespace(
+        FAULT_UPLOAD_HANG="upload_hang",
+        FAULT_UPLOAD_FAILURE="upload_failure",
+        FAULT_EXIT_CODE=70,
+    )
+    publisher = SaveLogsPeriodicallySidecar.__new__(SaveLogsPeriodicallySidecar)
+    publisher._debug_hooks = hooks
+    publisher._fault_mode = hooks.FAULT_UPLOAD_FAILURE
+    publisher._fault_triggered = Event()
+    publisher._fault_triggered.set()
+    uploader = mocker.patch("metaflow.mflog.save_logs_periodically.subprocess.call")
+
+    return_code = publisher._upload_logs()
+
+    assert return_code == hooks.FAULT_EXIT_CODE
+    uploader.assert_not_called()
 
 
 def test_log_publisher_traces_file_sizes_to_uploader_stdout(
