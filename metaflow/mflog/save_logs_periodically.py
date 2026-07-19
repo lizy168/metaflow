@@ -97,9 +97,7 @@ class SaveLogsPeriodicallySidecar(object):
         if hooks is not None and self._fault_triggered.is_set():
             if self._fault_mode == hooks.FAULT_UPLOAD_HANG:
                 time.sleep(
-                    hooks._float_env(
-                        hooks.FAULT_HANG_ENV_VAR, hooks.FAULT_HANG_SECONDS
-                    )
+                    hooks._float_env(hooks.FAULT_HANG_ENV_VAR, hooks.FAULT_HANG_SECONDS)
                 )
                 return None
             if self._fault_mode == hooks.FAULT_UPLOAD_FAILURE:
